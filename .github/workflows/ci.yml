@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Rust
+        run: rustup show
+
+      - name: Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Rust check
+        run: cargo check --workspace --locked
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Standalone systems lint
+        run: cargo clippy --manifest-path demo/corp-systems/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Standalone systems tests
+        run: cargo test --manifest-path demo/corp-systems/Cargo.toml --locked
+
+      - name: Standalone demo formatting
+        run: cargo fmt --manifest-path demo/corporate-agent/Cargo.toml --all --check
+
+      - name: Standalone demo lint
+        run: cargo clippy --manifest-path demo/corporate-agent/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Standalone demo tests
+        run: cargo test --manifest-path demo/corporate-agent/Cargo.toml --locked
+
+  python-checks:
+    name: Python Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bench-corp
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        with:
+          version: "0.11.26"
+
+      - name: Sync Python environment
+        run: uv sync --locked
+
+      - name: Python tests
+        run: uv run pytest

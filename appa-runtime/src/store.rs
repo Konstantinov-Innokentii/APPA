@@ -1,0 +1,498 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+use appa_engine::branch::BranchError;
+use appa_engine::fact::{Fact, FactBatch, Revision};
+use appa_engine::value::TrajectoryId;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantId(String);
+
+impl TenantId {
+    pub fn new(id: impl Into<String>) -> Self {
+        TenantId(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StoreError {
+    #[error("unknown session {0}")]
+    UnknownSession(String),
+    #[error("session {session} is not owned by caller {tenant}")]
+    ForeignSession { session: String, tenant: String },
+    #[error("stale basis: the family is at revision {} (a concurrent branch advanced it)", current.value())]
+    Stale { current: Revision },
+    #[error("seeding the child failed: {0}")]
+    Seed(BranchError),
+}
+
+#[derive(Debug)]
+struct FamilyLog {
+    facts: Vec<Fact>,
+    revision: Revision,
+}
+
+#[derive(Debug)]
+struct Family {
+    log: Mutex<FamilyLog>,
+}
+
+impl Family {
+    fn new() -> Arc<Family> {
+        Arc::new(Family {
+            log: Mutex::new(FamilyLog {
+                facts: Vec::new(),
+                revision: Revision::ZERO,
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    tenant: TenantId,
+    family: Arc<Family>,
+    parent: Option<TrajectoryId>,
+    turn_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Debug, Default)]
+pub struct SessionStore {
+    identity: StoreIdentity,
+    sessions: Mutex<BTreeMap<TrajectoryId, SessionRecord>>,
+    next_id: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StoreIdentity(Arc<()>);
+
+impl PartialEq for StoreIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StoreIdentity {}
+
+impl fmt::Debug for StoreIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoreIdentity")
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn new() -> Self {
+        SessionStore::default()
+    }
+
+    pub(crate) fn identity(&self) -> StoreIdentity {
+        self.identity.clone()
+    }
+
+    fn mint(&self) -> TrajectoryId {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        TrajectoryId::new(format!("appa-s-{n}"))
+    }
+
+    pub(crate) fn create_session(&self, tenant: TenantId) -> TrajectoryId {
+        let id = self.mint();
+        let record = SessionRecord {
+            tenant,
+            family: Family::new(),
+            parent: None,
+            turn_lock: Arc::new(AsyncMutex::new(())),
+        };
+        self.sessions.lock().expect("store lock").insert(id.clone(), record);
+        id
+    }
+
+    pub(crate) fn fork<F>(
+        &self,
+        tenant: &TenantId,
+        parent: &TrajectoryId,
+        make_seed: F,
+    ) -> Result<(TrajectoryId, Revision), StoreError>
+    where
+        F: FnOnce(&TrajectoryId, &[Fact], Revision) -> Result<FactBatch, BranchError>,
+    {
+        let (child, revision, _) = self.fork_inner(tenant, parent, make_seed, false)?;
+        Ok((child, revision))
+    }
+
+    pub(crate) fn fork_reserved<F>(
+        &self,
+        tenant: &TenantId,
+        parent: &TrajectoryId,
+        make_seed: F,
+    ) -> Result<(TrajectoryId, Revision, OwnedMutexGuard<()>), StoreError>
+    where
+        F: FnOnce(&TrajectoryId, &[Fact], Revision) -> Result<FactBatch, BranchError>,
+    {
+        let (child, revision, guard) = self.fork_inner(tenant, parent, make_seed, true)?;
+        Ok((
+            child,
+            revision,
+            guard.expect("a reserved fork creates its lease before publishing the child"),
+        ))
+    }
+
+    fn fork_inner<F>(
+        &self,
+        tenant: &TenantId,
+        parent: &TrajectoryId,
+        make_seed: F,
+        reserve_lease: bool,
+    ) -> Result<(TrajectoryId, Revision, Option<OwnedMutexGuard<()>>), StoreError>
+    where
+        F: FnOnce(&TrajectoryId, &[Fact], Revision) -> Result<FactBatch, BranchError>,
+    {
+        let family = self.family_of(tenant, parent)?;
+        let child = self.mint();
+        let revision = {
+            let mut log = family.log.lock().expect("family lock");
+            let batch = make_seed(&child, &log.facts, log.revision).map_err(StoreError::Seed)?;
+            if batch.basis != log.revision {
+                return Err(StoreError::Stale { current: log.revision });
+            }
+            log.facts.extend(batch.facts);
+            log.revision = log.revision.next();
+            log.revision
+        };
+        let turn_lock = Arc::new(AsyncMutex::new(()));
+        let guard = reserve_lease.then(|| {
+            turn_lock
+                .clone()
+                .try_lock_owned()
+                .expect("a new child turn lock is uncontended before publication")
+        });
+        self.sessions.lock().expect("store lock").insert(
+            child.clone(),
+            SessionRecord {
+                tenant: tenant.clone(),
+                family,
+                parent: Some(parent.clone()),
+                turn_lock,
+            },
+        );
+        Ok((child, revision, guard))
+    }
+
+    pub(crate) fn parent_of(
+        &self,
+        tenant: &TenantId,
+        session: &TrajectoryId,
+    ) -> Result<Option<TrajectoryId>, StoreError> {
+        let sessions = self.sessions.lock().expect("store lock");
+        Ok(require_owned(&sessions, tenant, session)?.parent.clone())
+    }
+
+    pub(crate) fn turn_lock(
+        &self,
+        tenant: &TenantId,
+        session: &TrajectoryId,
+    ) -> Result<Arc<AsyncMutex<()>>, StoreError> {
+        let sessions = self.sessions.lock().expect("store lock");
+        Ok(require_owned(&sessions, tenant, session)?.turn_lock.clone())
+    }
+
+    pub fn snapshot(&self, tenant: &TenantId, session: &TrajectoryId) -> Result<(Vec<Fact>, Revision), StoreError> {
+        let family = self.family_of(tenant, session)?;
+        let log = family.log.lock().expect("family lock");
+        Ok((log.facts.clone(), log.revision))
+    }
+
+    pub(crate) fn conditional_append(
+        &self,
+        tenant: &TenantId,
+        session: &TrajectoryId,
+        batch: FactBatch,
+    ) -> Result<Revision, StoreError> {
+        let family = self.family_of(tenant, session)?;
+        let mut log = family.log.lock().expect("family lock");
+        if batch.basis != log.revision {
+            return Err(StoreError::Stale { current: log.revision });
+        }
+        log.facts.extend(batch.facts);
+        log.revision = log.revision.next();
+        Ok(log.revision)
+    }
+
+    pub(crate) fn finalize<F>(
+        &self,
+        tenant: &TenantId,
+        session: &TrajectoryId,
+        decide: F,
+    ) -> Result<Revision, StoreError>
+    where
+        F: FnOnce(&[Fact], Revision) -> Option<FactBatch>,
+    {
+        let family = self.family_of(tenant, session)?;
+        let mut log = family.log.lock().expect("family lock");
+        match decide(&log.facts, log.revision) {
+            Some(batch) => {
+                if batch.basis != log.revision {
+                    return Err(StoreError::Stale { current: log.revision });
+                }
+                log.facts.extend(batch.facts);
+                log.revision = log.revision.next();
+                Ok(log.revision)
+            }
+
+            None => Ok(log.revision),
+        }
+    }
+
+    fn family_of(&self, tenant: &TenantId, session: &TrajectoryId) -> Result<Arc<Family>, StoreError> {
+        let sessions = self.sessions.lock().expect("store lock");
+        Ok(require_owned(&sessions, tenant, session)?.family.clone())
+    }
+}
+
+fn require_owned<'a>(
+    sessions: &'a BTreeMap<TrajectoryId, SessionRecord>,
+    tenant: &TenantId,
+    session: &TrajectoryId,
+) -> Result<&'a SessionRecord, StoreError> {
+    let record = sessions
+        .get(session)
+        .ok_or_else(|| StoreError::UnknownSession(session.as_str().to_string()))?;
+    if &record.tenant != tenant {
+        return Err(StoreError::ForeignSession {
+            session: session.as_str().to_string(),
+            tenant: tenant.as_str().to_string(),
+        });
+    }
+    Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use appa_engine::fact::{BoundaryKind, Fact};
+    use appa_engine::label::Label;
+    use appa_engine::projection::Projection;
+
+    fn boundary(trajectory: &TrajectoryId) -> Fact {
+        Fact::Boundary {
+            trajectory: trajectory.clone(),
+            kind: BoundaryKind::TurnEnd,
+        }
+    }
+
+    fn batch(basis: Revision, facts: Vec<Fact>) -> FactBatch {
+        FactBatch::new(basis, facts)
+    }
+
+    fn seed(parent: TrajectoryId) -> impl FnOnce(&TrajectoryId, &[Fact], Revision) -> Result<FactBatch, BranchError> {
+        move |child, _facts, revision| {
+            Ok(FactBatch::new(
+                revision,
+                vec![Fact::Boundary {
+                    trajectory: child.clone(),
+                    kind: BoundaryKind::Fork {
+                        parent,
+                        seed: Label::top(),
+                        return_policy: appa_engine::fact::ReturnPolicy::Raw,
+                    },
+                }],
+            ))
+        }
+    }
+
+    #[test]
+    fn append_then_replay_reconstructs_state() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let s = store.create_session(tenant.clone());
+
+        store
+            .conditional_append(&tenant, &s, batch(Revision::ZERO, vec![boundary(&s)]))
+            .unwrap();
+        let rev = store
+            .conditional_append(&tenant, &s, batch(Revision::new(1), vec![boundary(&s)]))
+            .unwrap();
+        assert_eq!(rev, Revision::new(2));
+
+        let (facts, revision) = store.snapshot(&tenant, &s).unwrap();
+        let projection = Projection::build(&facts, revision);
+        assert_eq!(projection.revision(), Revision::new(2));
+        assert_eq!(projection.view(&s).boundary_count(), 2);
+    }
+
+    #[test]
+    fn concurrent_double_consume_is_rejected() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let s = store.create_session(tenant.clone());
+
+        store
+            .conditional_append(&tenant, &s, batch(Revision::ZERO, vec![boundary(&s)]))
+            .unwrap();
+        let stale = store.conditional_append(&tenant, &s, batch(Revision::ZERO, vec![boundary(&s)]));
+        assert_eq!(
+            stale,
+            Err(StoreError::Stale {
+                current: Revision::new(1)
+            })
+        );
+    }
+
+    #[test]
+    fn finalize_lands_in_bounded_steps_under_contention() {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let store = Arc::new(SessionStore::new());
+        let tenant = TenantId::new("host-a");
+        let s = store.create_session(tenant.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let competitor = {
+            let store = store.clone();
+            let tenant = tenant.clone();
+            let s = s.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut appended = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let (_, rev) = store.snapshot(&tenant, &s).unwrap();
+                    if store
+                        .conditional_append(&tenant, &s, batch(rev, vec![boundary(&s)]))
+                        .is_ok()
+                    {
+                        appended += 1;
+                    }
+                }
+                appended
+            })
+        };
+
+        let final_rev = store
+            .finalize(&tenant, &s, |_facts, revision| {
+                Some(batch(revision, vec![boundary(&s)]))
+            })
+            .unwrap();
+        assert!(final_rev.value() >= 1);
+        stop.store(true, Ordering::Relaxed);
+
+        let appended = competitor.join().unwrap();
+        let (_, rev) = store.snapshot(&tenant, &s).unwrap();
+
+        assert_eq!(rev, Revision::new(appended + 1));
+    }
+
+    #[test]
+    fn finalize_is_idempotent_when_the_close_is_already_in_the_log() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let s = store.create_session(tenant.clone());
+
+        let close = |facts: &[Fact], revision: Revision| {
+            let already_closed = facts.iter().any(|f| {
+                matches!(
+                    f,
+                    Fact::Boundary {
+                        kind: BoundaryKind::TurnEnd,
+                        ..
+                    }
+                )
+            });
+            (!already_closed).then(|| batch(revision, vec![boundary(&s)]))
+        };
+        let first = store.finalize(&tenant, &s, close).unwrap();
+        let second = store.finalize(&tenant, &s, close).unwrap();
+
+        assert_eq!(first, Revision::new(1));
+        assert_eq!(second, Revision::new(1));
+        assert_eq!(store.snapshot(&tenant, &s).unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn foreign_session_and_parent_are_rejected() {
+        let store = SessionStore::new();
+        let owner = TenantId::new("host-a");
+        let intruder = TenantId::new("host-b");
+        let s = store.create_session(owner.clone());
+
+        assert!(matches!(
+            store.snapshot(&intruder, &s),
+            Err(StoreError::ForeignSession { .. })
+        ));
+        assert!(matches!(
+            store.fork(&intruder, &s, seed(s.clone())),
+            Err(StoreError::ForeignSession { .. })
+        ));
+        let missing = TrajectoryId::new("appa-s-999");
+        assert!(matches!(
+            store.snapshot(&owner, &missing),
+            Err(StoreError::UnknownSession(_))
+        ));
+    }
+
+    #[test]
+    fn fork_commits_the_seed_atomically_into_the_shared_family_log() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let parent = store.create_session(tenant.clone());
+        let (child, revision) = store.fork(&tenant, &parent, seed(parent.clone())).unwrap();
+
+        assert_eq!(revision, Revision::new(1));
+
+        let (facts, rev) = store.snapshot(&tenant, &parent).unwrap();
+        let projection = Projection::build(&facts, rev);
+        assert_eq!(projection.view(&parent).parent_of(&child), Some(&parent));
+        assert_eq!(store.parent_of(&tenant, &child).unwrap(), Some(parent));
+    }
+
+    #[test]
+    fn a_rejected_seed_registers_no_child() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let parent = store.create_session(tenant.clone());
+
+        let result = store.fork(&tenant, &parent, |_child, _facts, _rev| {
+            Err(BranchError::ParentUnresolved)
+        });
+        assert!(matches!(result, Err(StoreError::Seed(BranchError::ParentUnresolved))));
+
+        assert_eq!(store.snapshot(&tenant, &parent).unwrap(), (vec![], Revision::ZERO));
+    }
+
+    #[test]
+    fn a_root_session_has_no_parent() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let root = store.create_session(tenant.clone());
+        assert_eq!(store.parent_of(&tenant, &root).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_fork_publishes_the_child_with_its_turn_lease_held() {
+        let store = SessionStore::new();
+        let tenant = TenantId::new("host-a");
+        let parent = store.create_session(tenant.clone());
+        let (child, _, guard) = store.fork_reserved(&tenant, &parent, seed(parent.clone())).unwrap();
+        let lease = store.turn_lock(&tenant, &child).unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lease.clone().lock_owned())
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lease.lock_owned())
+                .await
+                .is_ok()
+        );
+    }
+}

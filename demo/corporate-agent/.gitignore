@@ -1,0 +1,6 @@
+/target
+/target-*/
+/.env
+/data/email/*
+!/data/email/.gitkeep
+.DS_Store
